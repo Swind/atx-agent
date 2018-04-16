@@ -36,10 +36,10 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/openatx/androidutils"
-	"github.com/openatx/atx-agent/cmdctrl"
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
 	"github.com/shogo82148/androidbinary/apk"
+	"github.com/swind/atx-agent/cmdctrl"
 )
 
 var (
@@ -704,6 +704,41 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 		}()
 	})
 
+	// Default timeout is 2 hours
+	timer := time.NewTimer(time.Duration(2) * time.Hour)
+	go func() {
+		<-timer.C
+		if _, err := runShell("reboot", "-p"); err != nil {
+			log.Println("poweroff machine after 2 hours")
+		}
+	}()
+	m.HandleFunc("/poweroff", func(w http.ResponseWriter, r *http.Request) {
+		vals := r.URL.Query()
+		parameter, ok := vals["timerTime"]
+
+		if ok {
+			timerTime, err := strconv.Atoi(parameter[0])
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Can't convert %s to integer", parameter[0]), 500)
+			}
+
+			// Reset the timer
+			if !timer.Stop() {
+				<-timer.C
+			}
+			timer.Reset(time.Duration(timerTime) * time.Second)
+
+			go func() {
+				<-timer.C
+				if _, err := runShell("reboot", "-p"); err != nil {
+					log.Println("poweroff machine after ", timerTime)
+				}
+			}()
+		} else {
+			http.Error(w, fmt.Sprintf("The parameter 'timerTime' is required."), 400)
+		}
+	})
+
 	m.HandleFunc("/uiautomator", func(w http.ResponseWriter, r *http.Request) {
 		err := service.Start("uiautomator")
 		if err == nil {
@@ -727,20 +762,7 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 		http.ServeFile(w, r, filepath)
 	})
 
-	// keep ApkService always running
-	// if no activity in 5min, then restart apk service
-	const apkServiceTimeout = 5 * time.Minute
-	apkServiceTimer := time.NewTimer(apkServiceTimeout)
-	go func() {
-		for range apkServiceTimer.C {
-			log.Println("startservice com.github.uiautomator/.Service")
-			runShell("am", "startservice", "-n", "com.github.uiautomator/.Service")
-			apkServiceTimer.Reset(apkServiceTimeout)
-		}
-	}()
-
 	m.HandleFunc("/info/battery", func(w http.ResponseWriter, r *http.Request) {
-		apkServiceTimer.Reset(apkServiceTimeout)
 		devInfo := getDeviceInfo()
 		devInfo.Battery.Update()
 		if err := tunnel.UpdateInfo(devInfo); err != nil {
@@ -751,7 +773,6 @@ func ServeHTTP(lis net.Listener, tunnel *TunnelProxy) error {
 	}).Methods("POST")
 
 	m.HandleFunc("/info/rotation", func(w http.ResponseWriter, r *http.Request) {
-		apkServiceTimer.Reset(apkServiceTimeout)
 		var direction int                                 // 0,1,2,3
 		err := json.NewDecoder(r.Body).Decode(&direction) // TODO: auto get rotation
 		if err == nil {
